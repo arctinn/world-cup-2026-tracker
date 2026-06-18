@@ -39,25 +39,10 @@ The React frontend applies dynamic Javascript `Date` logic to incoming data arra
 
 ## 🛠️ Local Development Setup
 
-### 1. Backend (FastAPI Data Engine)
+### Backend (FastAPI Data Engine)
 Navigate to the backend directory and install the Python dependencies. You must also install the Playwright browser binaries for the scraper to function.
 ```bash
 cd backend
 pip install -r requirements.txt
 playwright install
 uvicorn main:app --reload
-
-### 2. Frontend (React Dashboard)
-Open a new terminal window, navigate to the frontend directory, and start the Vite development server.
-
-'''bash
-cd frontend
-npm install
-npm run dev
-
-##📈 Future Roadmap
-[ ] Implement WebSockets (socket.io) for true sub-second live score pushing instead of polling.
-
-[ ] Add historical data comparison tabs for previous World Cup tournaments.
-
-[ ] Implement a predictive analytics route using Pandas to forecast group stage advancement probabilities.
