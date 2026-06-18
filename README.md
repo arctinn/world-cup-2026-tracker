@@ -47,7 +47,7 @@ pip install -r requirements.txt
 playwright install
 uvicorn main:app --reload
 
-2. Frontend (React Dashboard)
+### 2. Frontend (React Dashboard)
 Open a new terminal window, navigate to the frontend directory, and start the Vite development server.
 
 '''bash
@@ -55,7 +55,7 @@ cd frontend
 npm install
 npm run dev
 
-📈 Future Roadmap
+##📈 Future Roadmap
 [ ] Implement WebSockets (socket.io) for true sub-second live score pushing instead of polling.
 
 [ ] Add historical data comparison tabs for previous World Cup tournaments.
