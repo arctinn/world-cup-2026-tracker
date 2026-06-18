@@ -2,231 +2,203 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from datetime import datetime
-from database import get_db, engine
+
+# Import your local files
 import models
-import schemas
 import services
+from database import engine, SessionLocal
 
-# Automatically create database tables if they don't exist
-models.Base.metadata.create_all(bind=engine)
+# 1. Initialize the FastAPI App ONCE
+app = FastAPI(title="World Cup 2026 Data Engine API")
 
-app = FastAPI(title="World Cup Tracker API")
-
-# Configure CORS to allow your React app to fetch data securely
+# 2. Add CORS Middleware ONCE so React can communicate securely
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:5174"],
+    allow_origins=["*"], # Allows any local port (like 5173) to fetch data
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# 3. Database Initialization
+# NOTE: The DROP TABLE lines are commented out so we don't erase your real data on restart!
+# If you ever need to completely nuke the database again, just uncomment these.
+# with engine.connect() as conn:
+#     conn.execute(text("DROP TABLE IF EXISTS match_events CASCADE"))
+#     conn.execute(text("DROP TABLE IF EXISTS players CASCADE"))
+#     conn.execute(text("DROP TABLE IF EXISTS standings CASCADE"))
+#     conn.execute(text("DROP TABLE IF EXISTS teams CASCADE"))
+#     conn.execute(text("DROP TABLE IF EXISTS matches CASCADE"))
+#     conn.commit()
+
+# Ensure tables exist
+models.Base.metadata.create_all(bind=engine)
+
+# 4. Dependency to get the Database Session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Prevent the 404 error when visiting the root URL
 @app.get("/")
 def read_root():
-    return {"status": "Backend server is running smoothly"}
+    return {"message": "World Cup Data Engine is live and running!"}
 
-@app.get("/db-test")
-def test_db_connection(db: Session = Depends(get_db)):
-    try:
-        result = db.execute(text("SELECT 1")).fetchone()
-        if result[0] == 1:
-            return {"database_status": "Connected successfully to world_cup_db!"}
-    except Exception as e:
-        return {"database_status": "Connection failed", "error": str(e)}
 
-# --- TEAM ROUTES ---
+# =====================================================================
+# DATA PIPELINE DATA SYNCHRONIZATION ENDPOINTS (POST)
+# =====================================================================
 
-@app.post("/api/teams/", response_model=schemas.TeamResponse)
-def create_team(team: schemas.TeamCreate, db: Session = Depends(get_db)):
-    # Check if a team with this name or code already exists to prevent duplicates
-    existing_team = db.query(models.Team).filter(
-        (models.Team.name == team.name) | (models.Team.country_code == team.country_code)
-    ).first()
-    
-    if existing_team:
-        raise HTTPException(status_code=400, detail="Team or Country Code already registered")
-
-    db_team = models.Team(**team.model_dump())
-    db.add(db_team)
-    db.commit()
-    db.refresh(db_team)
-    return db_team
-
-@app.get("/api/teams/", response_model=list[schemas.TeamResponse])
-def get_all_teams(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    return db.query(models.Team).offset(skip).limit(limit).all()
-
-# --- MATCH ROUTES ---
-
-@app.post("/api/matches/", response_model=schemas.MatchResponse)
-def create_match(match: schemas.MatchCreate, db: Session = Depends(get_db)):
-    # Business Logic: A team cannot play itself
-    if match.home_team_id == match.away_team_id:
-        raise HTTPException(status_code=400, detail="A team cannot play against itself")
-
-    # Verify both teams actually exist in the database
-    home_team = db.query(models.Team).filter(models.Team.team_id == match.home_team_id).first()
-    away_team = db.query(models.Team).filter(models.Team.team_id == match.away_team_id).first()
-    
-    if not home_team or not away_team:
-        raise HTTPException(status_code=404, detail="One or both teams not found in the database")
-
-    db_match = models.Match(**match.model_dump())
-    db.add(db_match)
-    db.commit()
-    db.refresh(db_match)
-    return db_match
-
-@app.get("/api/matches/", response_model=list[schemas.MatchResponse])
-def get_all_matches(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    return db.query(models.Match).offset(skip).limit(limit).all()
-
-@app.get("/api/matches/today", response_model=list[schemas.MatchResponse])
-def get_todays_matches(db: Session = Depends(get_db)):
-    """
-    Returns only matches scheduled, in-play, or finished for today.
-    Perfect for your React app's main dashboard feed.
-    """
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = datetime.now().replace(hour=23, minute=59, second=59, microsecond=999999)
-    
-    # UPDATED: Changed match_date to kickoff_time to match models.py
-    return db.query(models.Match).filter(
-        models.Match.kickoff_time >= today_start,
-        models.Match.kickoff_time <= today_end
-    ).all()
-
-# --- PLAYER ROUTES ---
-
-@app.post("/api/players/", response_model=schemas.PlayerResponse)
-def create_player(player: schemas.PlayerCreate, db: Session = Depends(get_db)):
-    db_player = models.Player(**player.model_dump())
-    db.add(db_player)
-    db.commit()
-    db.refresh(db_player)
-    return db_player
-
-# --- MATCH EVENT ROUTES (The Core Tracker Logic) ---
-
-@app.post("/api/events/", response_model=schemas.MatchEventResponse)
-def create_match_event(event: schemas.MatchEventCreate, db: Session = Depends(get_db)):
-    db_event = models.MatchEvent(**event.model_dump())
-    db.add(db_event)
-    
-    # Automatically update live score if event is a goal
-    if event.event_type == models.MatchEventType.goal and event.player_id:
-        match = db.query(models.Match).filter(models.Match.match_id == event.match_id).first()
-        player = db.query(models.Player).filter(models.Player.player_id == event.player_id).first()
-        
-        if match and player:
-            if player.team_id == match.home_team_id:
-                match.home_score += 1
-            elif player.team_id == match.away_team_id:
-                match.away_score += 1
-
-    db.commit()
-    db.refresh(db_event)
-    return db_event
-
-@app.get("/api/matches/{match_id}/events", response_model=list[schemas.MatchEventResponse])
-def get_match_timeline(match_id: int, db: Session = Depends(get_db)):
-    return db.query(models.MatchEvent).filter(
-        models.MatchEvent.match_id == match_id
-    ).order_by(models.MatchEvent.match_minute.asc()).all()
-
-# --- EXTERNAL SYNC ROUTE ---
-
-@app.post("/api/sync-live-data/")
-def sync_with_world_api(db: Session = Depends(get_db)):
-    """
-    Triggers your live service module to fetch data from API-Football
-    and sync live scores into your local PostgreSQL tables.
-    """
+@app.post("/api/sync/matches")
+def sync_matches(db: Session = Depends(get_db)):
     result = services.fetch_and_sync_live_matches(db)
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result["message"])
     return result
 
-# --- STANDINGS ROUTE ---
+@app.post("/api/sync/teams")
+def sync_teams(db: Session = Depends(get_db)):
+    result = services.fetch_and_sync_teams(db)
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["message"])
+    return result
 
-@app.get("/api/standings/{group_letter}", response_model=list[schemas.TeamStanding])
-def get_group_standings(group_letter: str, db: Session = Depends(get_db)):
-    teams = db.query(models.Team).filter(models.Team.group_letter == group_letter.upper()).all()
-    standings = []
+@app.post("/api/sync/standings")
+def sync_standings(db: Session = Depends(get_db)):
+    result = services.fetch_and_sync_standings(db)
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["message"])
+    return result
+
+@app.post("/api/sync/rosters")
+def sync_rosters(db: Session = Depends(get_db)):
+    result = services.fetch_and_sync_rosters_and_stats(db)
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["message"])
+    return result
+
+
+# =====================================================================
+# FRONTEND API CORE DATA ENDPOINTS (GET)
+# =====================================================================
+
+@app.get("/api/matches")
+def get_matches(db: Session = Depends(get_db)):
+    matches = db.query(models.Match).order_by(models.Match.match_time.asc()).all()
+    return matches
+
+@app.get("/api/teams")
+def get_teams(db: Session = Depends(get_db)):
+    teams = db.query(models.Team).order_by(models.Team.name.asc()).all()
+    return teams
+
+@app.get("/api/standings")
+def get_standings(db: Session = Depends(get_db)):
+    """
+    Reads the dynamically synced Group Standings directly from the database.
+    """
+    standings = db.query(models.Standing).all()
+    grouped_standings = {}
     
-    for team in teams:
-        matches = db.query(models.Match).filter(
-            ((models.Match.home_team_id == team.team_id) | (models.Match.away_team_id == team.team_id)) &
-            (models.Match.status != models.MatchStatus.scheduled)
-        ).all()
+    for entry in standings:
+        team_info = db.query(models.Team).filter(models.Team.id == entry.team_id).first()
         
-        mp, w, d, l, gf, ga, pts = 0, 0, 0, 0, 0, 0, 0
+        entry_data = {
+            "team_name": team_info.name if team_info else "Unknown",
+            "abbreviation": team_info.abbreviation if team_info else "UNK",
+            "logo_url": team_info.logo_url if team_info else None,
+            "points": entry.points,
+            "matches_played": entry.matches_played,
+            "wins": entry.wins,
+            "draws": entry.draws,
+            "losses": entry.losses,
+            "goals_for": entry.goals_for,
+            "goals_against": entry.goals_against,
+            "goal_differential": entry.goal_differential
+        }
         
-        for match in matches:
-            mp += 1
-            if match.home_team_id == team.team_id:
-                gf += match.home_score
-                ga += match.away_score
-                if match.home_score > match.away_score:
-                    w += 1
-                    pts += 3
-                elif match.home_score == match.away_score:
-                    d += 1
-                    pts += 1
-                else:
-                    l += 1
-            else:
-                gf += match.away_score
-                ga += match.home_score
-                if match.away_score > match.home_score:
-                    w += 1
-                    pts += 3
-                elif match.away_score == match.home_score:
-                    d += 1
-                    pts += 1
-                else:
-                    l += 1
-                    
-        standings.append({
-            "team_id": team.team_id,
-            "name": team.name,
-            "country_code": team.country_code,
-            "group_letter": team.group_letter,
-            "matches_played": mp,
-            "wins": w,
-            "draws": d,
-            "losses": l,
-            "goals_for": gf,
-            "goals_against": ga,
-            "goal_differential": gf - ga,
-            "points": pts
+        if entry.group_name not in grouped_standings:
+            grouped_standings[entry.group_name] = []
+        grouped_standings[entry.group_name].append(entry_data)
+        
+    for group in grouped_standings:
+        grouped_standings[group].sort(key=lambda x: (x["points"], x["goal_differential"]), reverse=True)
+        
+    return grouped_standings
+
+@app.get("/api/stats/golden-boot")
+def get_golden_boot_leaders(db: Session = Depends(get_db)):
+    # Pulls top 10 players sorted by goals, then assists
+    leaders = db.query(models.Player)\
+                .filter(models.Player.goals > 0)\
+                .order_by(models.Player.goals.desc(), models.Player.assists.desc())\
+                .limit(10)\
+                .all()
+    
+    output = []
+    for player in leaders:
+        # Include team details for country flag and name in UI
+        team_info = db.query(models.Team).filter(models.Team.id == player.team_id).first()
+        output.append({
+            "name": player.name,
+            "position": player.position,
+            "jersey_number": player.jersey_number,
+            "headshot_url": player.headshot_url,
+            "goals": player.goals,
+            "assists": player.assists,
+            "country": team_info.name if team_info else "Unknown",
+            "flag_url": team_info.logo_url if team_info else None
         })
-        
-    sorted_standings = sorted(
-        standings, 
-        key=lambda x: (x["points"], x["goal_differential"], x["goals_for"]), 
-        reverse=True
-    )
+    return output
+
+import random
+
+@app.post("/api/debug/seed-stats")
+def seed_tournament_stats(db: Session = Depends(get_db)):
+    # Find all players listed as Attackers/Forwards
+    forwards = db.query(models.Player).filter(
+        models.Player.position.ilike("%Forward%"),
+        models.Player.headshot_url != None # Only pick players with profile pictures for a better UI
+    ).limit(30).all()
     
-    return sorted_standings
+    if not forwards:
+        return {"status": "error", "message": "No forwards found. Sync rosters first."}
+        
+    # Give them realistic tournament stats
+    for player in forwards:
+        player.goals = random.randint(1, 6)
+        player.assists = random.randint(0, 3)
+        
+    db.commit()
+    return {"status": "success", "message": "Golden Boot leaderboard successfully populated with simulated data!"}
 
-# --- DATABASE RESET ROUTE (DEV ONLY) ---
+@app.post("/api/sync/leaders")
+def sync_leaders(db: Session = Depends(get_db)):
+    result = services.fetch_and_sync_leaders(db)
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["message"])
+    return result
 
-@app.delete("/api/reset-db/")
-def wipe_database(db: Session = Depends(get_db)):
+@app.post("/api/debug/reset-db")
+def reset_database():
     """
-    Wipes all data from the database. 
-    Used to clear out 2022 data before syncing 2026 data.
+    WARNING: This completely wipes the database and rebuilds it from scratch
+    using the latest columns in models.py.
     """
-    try:
-        # Delete in order of relationships to avoid foreign key errors
-        db.query(models.MatchEvent).delete()
-        db.query(models.Match).delete()
-        db.query(models.Player).delete()
-        db.query(models.Team).delete()
-        db.commit()
-        return {"status": "success", "message": "Database wiped completely clean. Ready for 2026."}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS players CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS standings CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS matches CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS teams CASCADE"))
+        conn.commit()
+    
+    # Rebuild the fresh tables with the new home_score and away_score columns
+    models.Base.metadata.create_all(bind=engine)
+    
+    return {
+        "status": "success", 
+        "message": "Database completely wiped and rebuilt with the latest schema. Ready for a fresh sync."
+    }
